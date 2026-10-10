@@ -1,0 +1,6 @@
+data/private/
+data/indexes/
+artifacts/
+.venv/
+__pycache__/
+*.pyc
