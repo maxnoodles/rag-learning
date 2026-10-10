@@ -1,5 +1,7 @@
 # 完成报告
 
+> 环境更新（2026-10-10）：以下是原完成时的记录。当前环境已迁移到 `02-RAG/.venv`，本章所有小节共用；旧小节环境和外部依赖 `.pth` 已移除。当前运行方式见 README。
+
 生成时间：2026-10-09 23:13:08 CST。项目：`/Users/noodles/Desktop/ai-engineer-learning/rag-learning/02-RAG/01-simple_rag`。
 
 ## 完成结论

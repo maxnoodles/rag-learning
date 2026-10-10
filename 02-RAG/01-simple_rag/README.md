@@ -19,20 +19,15 @@
 
 ## 终端会展示什么
 
-1. 缓存是否命中，若重建则说明原因。
-2. 模型路径、设备、精度与维度。
-3. Parser 输出的真实文档正文和来源。
-4. 每个 chunk 的正文、字符范围、token 数和 ID。
-5. 文档向量矩阵形状、第一条向量前 8 维。
-6. 磁盘索引 generation、文档与 chunk 数量。
-7. 原始 query 和查询向量维度。
-8. 候选 chunk、来源、余弦分数。
-9. MMR 逐项选择的相关性、冗余惩罚和最终分数。
-10. 去重、同组问答补全、预算不足的处理说明。
-11. 完整、可直接阅读的生成 prompt。
-12. Codex 回答及 `[E1]` 等引用，各阶段耗时。
+1. 原始问题、缓存是否命中及重建原因。
+2. Embedding 设备与维度，重建时的文档和 chunk 数量。
+3. 召回与 MMR 选择数量，选中片段的来源及 relevance / redundancy / MMR 分数。
+4. 上下文去重、补全或预算不足的处理说明，以及实际送给模型的证据正文和 `[E1]` 等来源。
+5. Codex 回答、状态和引用。
 
-缓存命中时阶段 3–6 跳过；会显示缓存 chunk 的定位信息。解析、切分和文档 embedding 不重复执行，query embedding 仍然需要执行。运行记录可选保存为 JSON，但全部结果默认在终端展示。
+缓存命中时跳过解析、切分和文档 embedding，仅计算 query embedding。终端不重复打印原文、每个 chunk、全部候选正文和 prompt 指令，不再计算或输出阶段与总耗时。
+
+使用 `--output-json artifacts/my-run.json` 可保存详细候选、MMR 选择、证据、完整 prompt 和回答；详细报告序列化和额外的上下文 token 计数仅在指定此参数时执行，报告不含耗时字段。
 
 ## MMR 是什么
 
@@ -68,7 +63,7 @@ MMR = λ × relevance − (1 − λ) × redundancy
 可重新导出同一批样例：
 
 ```sh
-.venv/bin/python scripts/export_chat_samples.py
+../.venv/bin/python scripts/export_chat_samples.py
 ```
 
 聊天正文、索引、SDK 检查文件和测试日志均在 Git 忽略目录。没有上传到 GitHub。正常回答阶段仅把筛选后的上下文交给 Codex 服务。
@@ -83,17 +78,24 @@ MMR = λ × relevance − (1 − λ) × redundancy
 
 ## 环境与测试
 
-已配置项目 `.venv`。embedding 的大型依赖通过 `.pth` 复用以下既有环境，不复制或重新下载模型：
+本章共用 `02-RAG/.venv`（Python 3.12）；`01-simple_rag` 及后续小节都使用它，小节不再单独建立 `.venv`。当前依赖已复制到章节环境，已移除指向历史 gemma 环境的 `.pth`，不再依赖那个环境。未重新下载模型或 Python 包。
 
-```text
-/Users/noodles/Documents/Codex/2026-10-06/h/work/gemma-venv
-```
-
-新机器可使用 Python 3.12 建立独立环境并安装 `requirements.txt`，另行提供本地模型目录和已登录的 Codex CLI。默认模型路径针对当前机器。SDK 生成阶段禁用 shell、MCP、web 等工具并检查返回活动；来源引用做格式和编号校验，语义是否真的被证据支持仍需评估。
+新机器在 `02-RAG` 目录运行：
 
 ```sh
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python scripts/evaluate_retrieval.py
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+另行提供本地模型目录和已登录的 Codex CLI。默认模型路径针对当前机器。
+
+Cursor 推荐直接打开 `02-RAG`，选择 `.venv/bin/python`；按 F5 可运行或调试小节。仓库根目录不放 Python 配置，请打开章节目录。`.vscode` 和虚拟环境均由 Git 忽略。切换到其他章节时，使用该章节自己的 `.venv`。
+
+SDK 生成阶段禁用 shell、MCP、web 等工具并检查返回活动；来源引用做格式和编号校验，语义是否真的被证据支持仍需评估。
+
+```sh
+../.venv/bin/python -m unittest discover -s tests -v
+../.venv/bin/python scripts/evaluate_retrieval.py
 ```
 
 详见 [完成报告](reports/COMPLETION_REPORT.md) 和 [测试报告](reports/TEST_REPORT.md)。检索评估为 6 个手选问题的功能检查，不代表正式检索 benchmark。

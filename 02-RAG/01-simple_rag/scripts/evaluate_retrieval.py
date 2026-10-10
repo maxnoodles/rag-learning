@@ -4,7 +4,6 @@ import os
 os.environ['OMP_NUM_THREADS']='1'; os.environ['MKL_NUM_THREADS']='1'
 import json
 import sys
-import time
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -36,15 +35,13 @@ def main():
     model=Embedder(args.model_path)
     rows=[]
     for query,expected in CASES:
-        start=time.perf_counter()
         recalled,selected=retrieve(snapshot,model.query(query),20,4,.7)
         rank=next((i for i,h in enumerate(recalled,1)
                    if snapshot.documents[h.chunk.doc_id].metadata.get('pair_id')==expected),None)
         evidence,_,_=build_context(snapshot,selected)
         retained=any(s.get('pair_id')==expected for e in evidence for s in e.sources)
         row=dict(query=query,expected_pair_id=expected,rank=rank,hit_at_1=rank==1,
-                 hit_at_3=rank is not None and rank<=3,final_context_contains_expected=retained,
-                 elapsed_seconds=round(time.perf_counter()-start,3))
+                 hit_at_3=rank is not None and rank<=3,final_context_contains_expected=retained)
         rows.append(row); print(json.dumps(row,ensure_ascii=False),flush=True)
     report=dict(case_count=len(rows),hit_at_1=sum(r['hit_at_1'] for r in rows)/len(rows),
                 hit_at_3=sum(r['hit_at_3'] for r in rows)/len(rows),

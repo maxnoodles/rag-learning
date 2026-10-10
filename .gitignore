@@ -13,3 +13,7 @@ data/indexes/
 **/indexes/
 artifacts/
 *.log
+
+# 编辑器本机配置（所有章节与小节）
+.vscode/
+*.code-workspace

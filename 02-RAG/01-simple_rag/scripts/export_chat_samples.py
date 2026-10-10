@@ -91,8 +91,6 @@ def main():
                               'excluded':'system, developer, tools, reasoning, commentary, citation footers',
                               'records':records}, ensure_ascii=False, indent=2))
     print(f'已导出 {len(records)} 组真实问答 → {args.output}')
-    for record in records:
-        print(f'{record["pair_id"]} | {record["title"]} | {record["question"][:70]}')
 
 
 if __name__ == '__main__':
