@@ -1,5 +1,14 @@
 # 测试报告
 
+## 2026-10-15：两轮检索与 Cross-Encoder
+
+- `../.venv/bin/python -m unittest discover -s tests -v`：45 / 45 通过。新增轮次合并与去重、第二轮独有候选进入 top-n、全部候选按原问题打分、同分稳定、候选不足、无效打分拒绝、抽象结果校验、禁止额外工具活动、retrieve-only 仍抽象与重排，以及抽象失败保留首轮结果的测试。
+- 已通过 `scripts/download_reranker.py` 下载 BAAI/bge-reranker-base；模型位于 Git 忽略的 `artifacts/models/`。使用已有依赖，无需新增 Python 包。
+- `./run.sh --top-k 4 --top-n 2 --output-json artifacts/two-round-smoke.json`：真实 Google embedding 与 BGE Cross-Encoder 均在 MPS 运行；25 文档 → 55 chunks；原问题与 Codex 抽象问题两轮各 4 个候选 → Merge 去重后 5 个 → 5 个全部重排 → 选中 2 个。
+- 选中两个 chunk 均来自 011.md，Cross-Encoder logits 约为 4.109691、0.910420；同组问答合并为 1 组证据。真实 Codex 回答状态 answered，引用 E1。抽象与回答的活动均仅含 userMessage/reasoning/agentMessage，无额外工具调用。
+- 已核对 JSON 的候选唯一性、全部重排分数降序、top-k/top-n 数量，以及最终引用属于生成上下文。JSON 和完整日志保存在 Git 忽略的 `artifacts/two-round-smoke.json` / `.log`。
+- `git diff --check`、启动脚本 shell 语法检查通过。`evaluate_retrieval.py` 明确保留为旧版单轮 RRF + MMR 基线。本次单问题真实运行证明链路可用，不代表检索质量基准；重排每对输入上限为 512 tokens，长文本可能被截断。
+
 ## 2026-10-14：递归切块与混合检索
 
 - 章节环境新增 langchain-text-splitters 1.1.3、jieba 0.42.1，pip check 通过。

@@ -1,5 +1,8 @@
 # 完成报告
 
+> 2026-10-15 更新：当前入口已改为原问题与 Codex 抽象问题两轮混合检索，每轮 top_k=4，Merge 去重后由本地 BGE Cross-Encoder 取 top_n=2。45 个测试及真实 MPS 检索、重排、Codex 回答验证通过。当前用法见 README，最新验证见 TEST_REPORT；下文为早期版本的历史完成记录。
+
+
 > 环境更新（2026-10-10）：以下是原完成时的记录。当前环境已迁移到 `02-RAG/.venv`，本章所有小节共用；旧小节环境和外部依赖 `.pth` 已移除。当前运行方式见 README。
 
 生成时间：2026-10-09 23:13:08 CST。项目：`/Users/noodles/Desktop/ai-engineer-learning/rag-learning/02-RAG/01-simple_rag`。

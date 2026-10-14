@@ -1,6 +1,6 @@
 # 本地 RAG 流水线设计
 
-状态：学习版已实现，具体测试结论见 reports/TEST_REPORT.md。2026-10-14。
+状态：学习版已实现，具体测试结论见 reports/TEST_REPORT.md。2026-10-15。
 
 ## 已确认并实现的学习版
 
@@ -8,16 +8,16 @@
 
 - 输入仅支持 TXT / Markdown，使用 25 组 AI/RAG 真实历史问答。
 - 在终端一次运行并分阶段完整打印结果；通过官方 Codex Python SDK 生成答案。
-- 仅使用原始 query，不改写；FAISS 向量检索与 jieba 分词的 BM25 关键词检索按加权 RRF 融合。
+- 两轮检索：先检索原始 query，再调用 Codex 抽象 query 并检索；每轮 FAISS 与 jieba BM25 按加权 RRF 融合，保留 top_k=4。
 - 问答为 chunk 的父级单位，长问答使用 LangChain RecursiveCharacterTextSplitter 递归多级切分，以 embedding tokenizer 限制完整输入，并保留问题、重叠和字符范围。
-- Retriever：FAISS + BM25 双路候选召回 → RRF 融合 → MMR 去冗余选择 → 精确去重 → 同组问答补全或范围合并 → 上下文预算。
+- Retriever：两轮候选按 chunk ID Merge 去重 → 本地 BGE Cross-Encoder 用原始 query 联合打分 → top_n=2 → 同组问答补全或范围合并 → 上下文预算。旧版 MMR 保留作基线。
 - 存储层支持指纹及完整性检查通过后复用索引，BM25 从同一快照在内存重建；当前命令行入口每次重建。
 - 终端打印检索证据，详细 prompt 可通过 --output-json 保存；仅依据检索证据回答、标注引用、证据不足则说明。
 - 学习版不提供元数据过滤；以后加入过滤时必须先定义候选集合内检索语义。
 - 解析、建库或发布失败保留上一成功快照，但不自动用与当前输入不匹配的旧缓存回答。
 - 上下文使用独立的 `o200k_base` 估算；证据预算不等于完整 SDK 请求窗口。
 
-当前模块：`schemas.py`、`document_parser.py`、`chunker.py`、`embedder.py`、`vector_store.py`、`lexical_index.py`、`retriever.py`、`context_builder.py`、`codex_adapter.py`，由 `run.py` 编排。MCP、PDF/OCR 是后续学习方向，本版未实现。
+当前模块：`schemas.py`、`document_parser.py`、`chunker.py`、`embedder.py`、`vector_store.py`、`lexical_index.py`、`retriever.py`、`reranker.py`、`context_builder.py`、`codex_adapter.py`，由 `run.py` 编排。MCP、PDF/OCR 是后续学习方向，本版未实现。
 
 ## 早期设计参考
 

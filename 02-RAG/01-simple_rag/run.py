@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""打印递归切块、FAISS + BM25 混合检索与 MMR 的关键结果；当前每次重建索引。"""
+"""两轮混合检索 → 合并去重 → Cross-Encoder 重排；当前每次重建索引。"""
 import argparse
 import fcntl
 import json
@@ -12,15 +12,17 @@ os.environ['OMP_NUM_THREADS']='1'
 os.environ['MKL_NUM_THREADS']='1'
 
 from rag.chunker import make_chunks
-from rag.codex_adapter import generate
+from rag.codex_adapter import abstract_query, generate
 from rag.context_builder import build_context, make_prompt, token_count
 from rag.document_parser import parse_documents
 from rag.embedder import Embedder
-from rag.retriever import retrieve
+from rag.retriever import recall, merge_rounds
+from rag.reranker import Reranker
 from rag.vector_store import fingerprint, load_current, save_snapshot
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = Path('/Users/noodles/Documents/Codex/2026-10-06/h/outputs/models/embeddinggemma-2')
+DEFAULT_RERANKER = ROOT/'artifacts/models/bge-reranker-base'
 DEFAULT_QUERY = 'FAISS IndexFlatIP 中的 Flat 和 IP 分别是什么意思？为什么归一化后可以按余弦相似度检索？'
 
 
@@ -61,21 +63,47 @@ def execute(args):
             finally:
                 fcntl.flock(lock,fcntl.LOCK_UN)
         report.update(generation=snapshot.generation,document_count=len(snapshot.documents),chunk_count=len(snapshot.chunks))
-        query_vector = embedder.query(args.query) if args.vector_weight > 0 else None
-        recalled, selected = retrieve(snapshot,query_vector,args.fetch_k,args.top_k,args.mmr_lambda,
-                                      query=args.query,vector_weight=args.vector_weight,rrf_k=args.rrf_k)
-        report['retrieval'] = dict(method='weighted_rrf_mmr', vector_weight=args.vector_weight,
+        report['retrieval'] = dict(method='two_round_rrf_cross_encoder', vector_weight=args.vector_weight,
                                    rrf_k=args.rrf_k,fetch_k=args.fetch_k,top_k=args.top_k,
-                                   mmr_lambda=args.mmr_lambda)
+                                   top_n=args.top_n,reranker_model=str(args.reranker_model_path))
         channels = 'FAISS' if args.vector_weight == 1 else 'BM25' if args.vector_weight == 0 else 'FAISS + BM25'
-        print(f'检索：{channels} → RRF 召回 {len(recalled)} 个候选 → MMR 选择 {len(selected)} 个片段',flush=True)
+        def search_round(name, query):
+            query_vector = embedder.query(query) if args.vector_weight > 0 else None
+            hits = recall(snapshot,query_vector,args.fetch_k,args.top_k,
+                          query=query,vector_weight=args.vector_weight,rrf_k=args.rrf_k)
+            print(f'{name}：{channels} → RRF 保留 {len(hits)} 个候选',flush=True)
+            if artifact:
+                report.setdefault('retrieval_rounds',[]).append(
+                    dict(name=name,query=query,recalled=[asdict(hit) for hit in hits]))
+            return hits
+
+        original_hits = search_round('original',args.query)
+        print('Codex 正在抽象问题…',flush=True)
+        abstraction = abstract_query(args.query,args.codex_model,args.timeout,args.codex_bin)
+        rewritten = abstraction['abstract_query']
+        report['abstract_query'] = rewritten
+        if artifact:
+            report['query_abstraction'] = abstraction
+        print(f'抽象问题：{rewritten}',flush=True)
+        abstract_hits = search_round('abstract',rewritten)
+        recalled = merge_rounds(('original',original_hits),('abstract',abstract_hits))
+        if artifact:
+            report['merged'] = [asdict(hit) for hit in recalled]
+        print(f'Merge：{len(original_hits)} + {len(abstract_hits)} → 去重后 {len(recalled)} 个候选',flush=True)
+        if recalled:
+            reranker = Reranker(args.reranker_model_path,args.device,args.reranker_batch_size)
+            print(f'Cross-Encoder：{args.reranker_model_path.name}；设备 {reranker.device}',flush=True)
+            ranked, selected = reranker.rerank(args.query,recalled,args.top_n)
+        else:
+            ranked, selected = [], []
+        print(f'重排：原始问题与候选联合打分 → 取 top_n={args.top_n}，选中 {len(selected)} 个片段',flush=True)
         for rank,hit in enumerate(selected,1):
             doc = snapshot.documents[hit.chunk.doc_id]
             vector_score = f'{hit.vector_score:.6f}' if hit.vector_score is not None else '-'
             bm25_score = f'{hit.bm25_score:.6f}' if hit.bm25_score is not None else '-'
             print(f'  #{rank} {doc.source} chunk={hit.chunk.chunk_id} | vector={vector_score} '
-                  f'BM25={bm25_score} RRF={hit.rrf_score:.6f} relevance={hit.relevance:.6f} '
-                  f'redundancy={hit.redundancy:.6f} MMR={hit.mmr_score:.6f}',flush=True)
+                  f'BM25={bm25_score} RRF={hit.rrf_score:.6f} '
+                  f'CrossEncoder={hit.cross_encoder_score:.6f} rounds={hit.retrieval_rounds}',flush=True)
         evidence, context, events = build_context(snapshot,selected,args.context_tokens)
         print(f'上下文：{len(evidence)} 组证据；预算 {args.context_tokens} tokens',flush=True)
         for event in events:
@@ -85,6 +113,7 @@ def execute(args):
         # 详细序列化和展示用计数只在请求保存报告时执行。
         if artifact:
             report.update(recalled=[asdict(h) for h in recalled],
+                          reranked=[asdict(h) for h in ranked],
                           selected=[asdict(h) for h in selected],
                           evidence=[asdict(e) for e in evidence],
                           context_tokens_estimated=token_count(context),prompt=prompt)
@@ -118,12 +147,14 @@ def main():
     parser.add_argument('--model-path',type=Path,default=DEFAULT_MODEL)
     parser.add_argument('--index-dir',type=Path,default=ROOT/'data/indexes')
     parser.add_argument('--rebuild',action='store_true')
-    parser.add_argument('--retrieve-only',action='store_true')
+    parser.add_argument('--retrieve-only',action='store_true',help='跳过最终回答；仍调用 Codex 抽象问题')
     parser.add_argument('--chunk-tokens',type=int,default=512)
     parser.add_argument('--overlap-tokens',type=int,default=64)
-    parser.add_argument('--fetch-k',type=int,default=20)
-    parser.add_argument('--top-k',type=int,default=4)
-    parser.add_argument('--mmr-lambda',type=float,default=0.7)
+    parser.add_argument('--fetch-k',type=int,default=20,help='每轮 FAISS/BM25 各路召回上限')
+    parser.add_argument('--top-k',type=int,default=4,help='每轮 RRF 融合后保留的候选数')
+    parser.add_argument('--top-n',type=int,default=2,help='两轮合并后 Cross-Encoder 最终保留数')
+    parser.add_argument('--reranker-model-path',type=Path,default=DEFAULT_RERANKER)
+    parser.add_argument('--reranker-batch-size',type=int,default=4)
     parser.add_argument('--vector-weight',type=float,default=0.5,help='RRF 向量权重；0=仅 BM25，1=仅向量')
     parser.add_argument('--rrf-k',type=int,default=60,help='RRF 排名平滑常数，至少为 1')
     parser.add_argument('--context-tokens',type=int,default=6000)
@@ -133,8 +164,10 @@ def main():
     parser.add_argument('--timeout',type=int,default=300)
     parser.add_argument('--output-json',type=Path,default=None,help='可选，保存详细检索结果、证据和 prompt')
     args = parser.parse_args()
-    if not args.query.strip() or not 1 <= args.top_k <= args.fetch_k or not 0 <= args.mmr_lambda <= 1:
-        parser.error('query 不能为空；1 <= top-k <= fetch-k；0 <= mmr-lambda <= 1')
+    if not args.query.strip() or not 1 <= args.top_k <= args.fetch_k or not 1 <= args.top_n <= 2*args.top_k:
+        parser.error('query 不能为空；1 <= top-k <= fetch-k；1 <= top-n <= 2 * top-k')
+    if args.reranker_batch_size < 1:
+        parser.error('reranker-batch-size 至少为 1')
     if not 32 <= args.chunk_tokens <= 8192 or not 0 <= args.overlap_tokens < args.chunk_tokens:
         parser.error('32 <= chunk-tokens <= 8192；0 <= overlap-tokens < chunk-tokens')
     if args.context_tokens < 64 or args.timeout <= 0:
@@ -143,6 +176,7 @@ def main():
         parser.error('0 <= vector-weight <= 1；rrf-k 至少为 1')
     args.rebuild = True
     args.docs=args.docs.resolve(); args.model_path=args.model_path.resolve(); args.index_dir=args.index_dir.resolve()
+    args.reranker_model_path=args.reranker_model_path.resolve()
     try:
         execute(args)
     except Exception:

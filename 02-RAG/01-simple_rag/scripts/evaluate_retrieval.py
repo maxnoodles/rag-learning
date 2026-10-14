@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""6 个手选真实聊天问题的检索检查；不等同正式 benchmark。"""
+"""旧版单轮 RRF + MMR 基线，6 个手选问题；不评估当前两轮 Cross-Encoder 流程。"""
 import os
 os.environ['OMP_NUM_THREADS']='1'; os.environ['MKL_NUM_THREADS']='1'
 import json
@@ -43,7 +43,7 @@ def main():
         row=dict(query=query,expected_pair_id=expected,rank=rank,hit_at_1=rank==1,
                  hit_at_3=rank is not None and rank<=3,final_context_contains_expected=retained)
         rows.append(row); print(json.dumps(row,ensure_ascii=False),flush=True)
-    report=dict(case_count=len(rows),hit_at_1=sum(r['hit_at_1'] for r in rows)/len(rows),
+    report=dict(method="single_round_rrf_mmr_baseline",case_count=len(rows),hit_at_1=sum(r['hit_at_1'] for r in rows)/len(rows),
                 hit_at_3=sum(r['hit_at_3'] for r in rows)/len(rows),
                 final_context_hit=sum(r['final_context_contains_expected'] for r in rows)/len(rows),
                 cases=rows,scope='hand-selected 6-case functional retrieval check, not a benchmark')

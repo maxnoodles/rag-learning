@@ -34,6 +34,8 @@ class Hit:
     vector_rank: int | None = None
     bm25_rank: int | None = None
     rrf_score: float = 0.0
+    retrieval_rounds: list[str] = field(default_factory=list)
+    cross_encoder_score: float | None = None
 
 
 @dataclass
