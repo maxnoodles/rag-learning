@@ -1,5 +1,18 @@
 # 测试报告
 
+## 2026-10-14：递归切块与混合检索
+
+- 章节环境新增 langchain-text-splitters 1.1.3、jieba 0.42.1，pip check 通过。
+- `../.venv/bin/python -m unittest discover -s tests -v`：36 / 36 通过。新增递归边界、重复原文定位、token 重叠、中文/英文 BM25、RRF 去重与原始分数、关键词补充召回、单通道与空匹配、快照恢复/删除一致性验证。
+- `./run.sh --retrieve-only --output-json artifacts/hybrid-retrieval.json`：真实 MPS embedding，25 文档 → 55 chunks，完整 embedding 输入最多 504 tokens（上限 512）。所有 chunks 的原文范围准确，每篇文档全文被覆盖，存储层缓存加载校验通过。
+- 默认查询首个选中来源为 011.md；向量/BM25 权重各 0.5，RRF k=60，fetch-k=20、top-k=4、MMR λ=0.7。
+- `../.venv/bin/python scripts/evaluate_retrieval.py`：6 个手选问题的预期来源全部在融合候选首位，最终上下文全部保留。仅为功能检查，不能据此证明相对于纯向量的质量提升。
+- 本次验证到检索与上下文阶段，没有重新调用 Codex 生成答案。详细 JSON 与日志在 Git 忽略的 artifacts/ 中。
+- 当前命令行入口保留既有的每次重建行为；缓存恢复单独通过存储层验证。
+- `git diff --check`、启动脚本 shell 语法检查通过。
+
+以下为之前版本的历史测试记录。
+
 > 环境更新（2026-10-10）：以下是原完成时的记录。当前环境已迁移到 `02-RAG/.venv`，本章所有小节共用；旧小节环境和外部依赖 `.pth` 已移除。当前运行方式见 README。
 
 生成时间：2026-10-09 23:13:08 CST。结果：全部列明的最终检查通过。测试使用真实本地模型和真实 Codex 调用，单元测试中的合成向量仅用于检验边界行为。

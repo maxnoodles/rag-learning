@@ -21,6 +21,7 @@ from rag.document_parser import parse_documents
 from rag.schemas import Chunk, Document, Hit
 from rag.vector_store import fingerprint, load_current, save_snapshot
 from rag.retriever import retrieve
+from rag.lexical_index import BM25Index, tokenize
 
 # 单元测试直接使用存储层，未经过 Embedder.__init__，也需限制两个线程池。
 import faiss
@@ -101,6 +102,46 @@ class ChunkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_chunks([],CharacterTokenizer(),64,64)
 
+    def test_recursive_paragraphs_before_sentences(self):
+        text = '第一段。'*5+'\n\n'+'第二段。'*5+'\n\n'+'第三段。'*5
+        doc = Document('a','a.txt','A',text)
+        chunks = make_chunks([doc],CharacterTokenizer(),64,0)
+        self.assertEqual([c.text for c in chunks],
+                         ['第一段。'*5+'\n\n', '第二段。'*5+'\n\n', '第三段。'*5])
+
+    def test_repeated_text_whitespace_and_zero_overlap_spans(self):
+        doc = Document('a','a.txt','A','  '+('重复🙂。\n\n'*30)+'尾部  ')
+        chunks = make_chunks([doc],CharacterTokenizer(),64,0)
+        self.assertEqual(''.join(c.text for c in chunks),doc.text)
+        self.assertEqual(chunks[0].start,0)
+        self.assertEqual(chunks[-1].end,len(doc.text))
+        self.assertTrue(all(a.end==b.start for a,b in zip(chunks,chunks[1:])))
+
+    def test_overlap_respects_token_budget_with_repeated_text(self):
+        doc = Document('a','a.txt','A','重复🙂。'*90)
+        chunks = make_chunks([doc],CharacterTokenizer(),64,8)
+        for a,b in zip(chunks,chunks[1:]):
+            self.assertGreater(b.end,a.end)
+            self.assertGreaterEqual(b.start,a.start)
+            self.assertLessEqual(len(CharacterTokenizer().encode(
+                doc.text[b.start:a.end],add_special_tokens=False)),8)
+        self.assertEqual(chunks[-1].end,len(doc.text))
+        self.assertTrue(all(c.token_count <= 64 for c in chunks))
+
+
+class BM25Tests(unittest.TestCase):
+    def test_chinese_and_case_insensitive_code_terms(self):
+        index = BM25Index(['苹果向量数据库 FAISS IndexFlatIP', '香蕉强化学习奖励', '橙子文档切分'])
+        self.assertEqual(index.search('向量数据库 indexflatip',3)[0][0],0)
+        self.assertIn('faiss', tokenize('FAISS'))
+
+    def test_common_terms_positive_and_no_match_empty(self):
+        index = BM25Index(['相同 common','相同 common'])
+        self.assertEqual(len(index.search('common',10)),2)
+        self.assertEqual(index.search('不存在的 qwerty',10),[])
+        self.assertEqual(index.search('？！',10),[])
+        self.assertEqual(BM25Index(['','！！']).search('test',2),[])
+
 
 class StoreAndRetrievalTests(unittest.TestCase):
     def setUp(self):
@@ -145,16 +186,65 @@ class StoreAndRetrievalTests(unittest.TestCase):
 
     def test_mmr_relevance_and_diversity(self):
         q=self.vectors[0]
-        recalled,selected=retrieve(self.snapshot,q,3,2,0.4)
+        recalled,selected=retrieve(self.snapshot,q,3,2,0.4,vector_weight=1)
         self.assertEqual(recalled[0].chunk.doc_id,'0')
         self.assertEqual([s.chunk.doc_id for s in selected],['0','2'])
-        _,relevant=retrieve(self.snapshot,q,3,2,1)
+        _,relevant=retrieve(self.snapshot,q,3,2,1,vector_weight=1)
         self.assertEqual([s.chunk.doc_id for s in relevant],['0','1'])
 
     def test_fetch_beyond_corpus_no_negative_ids(self):
-        recalled,selected=retrieve(self.snapshot,self.vectors[0],20,4,0.7)
+        recalled,selected=retrieve(self.snapshot,self.vectors[0],20,4,0.7,query='正文')
         self.assertEqual(len(recalled),3)
         self.assertEqual(len(selected),3)
+
+    def test_bm25_recalls_keyword_missing_from_vector_candidates(self):
+        docs=[Document('a','a.md','A','alpha background'),
+              Document('b','b.md','B','beta background'),
+              Document('c','c.md','C','IndexFlatIP 归一化向量检索')]
+        snap=save_snapshot(self.root,'hybrid',{},docs,[one_chunk(d) for d in docs],self.vectors)
+        recalled,selected=retrieve(snap,self.vectors[0],1,1,1,query='indexflatip')
+        self.assertEqual(selected[0].chunk.doc_id,'a')  # 同权重 RRF 同分时稳定按 ID 排序。
+        recalled,selected=retrieve(snap,self.vectors[0],1,1,1,query='indexflatip',vector_weight=.4)
+        self.assertEqual(selected[0].chunk.doc_id,'c')
+        self.assertIsNone(selected[0].vector_rank)
+        self.assertEqual(selected[0].bm25_rank,1)
+        self.assertGreater(selected[0].bm25_score,0)
+        self.assertAlmostEqual(selected[0].rrf_score,.6/61)
+        self.assertAlmostEqual(selected[0].relevance,.6)
+
+    def test_rrf_deduplicates_and_preserves_scores(self):
+        recalled,selected=retrieve(self.snapshot,self.vectors[0],3,3,1,query='正文 0')
+        self.assertEqual(len({h.chunk.chunk_id for h in recalled}),3)
+        first=recalled[0]
+        self.assertEqual(first.chunk.doc_id,'0')
+        self.assertEqual(first.vector_rank,1)
+        self.assertEqual(first.bm25_rank,1)
+        self.assertAlmostEqual(first.rrf_score,1/61)
+        self.assertAlmostEqual(first.relevance,1)
+        self.assertIsNotNone(first.vector_score)
+        self.assertIsNotNone(first.bm25_score)
+
+    def test_pure_bm25_and_unmatched_query(self):
+        recalled,selected=retrieve(self.snapshot,None,3,2,1,query='2',vector_weight=0)
+        self.assertEqual([h.chunk.doc_id for h in recalled],['2'])
+        self.assertEqual(selected[0].chunk.doc_id,'2')
+        self.assertEqual(retrieve(self.snapshot,None,3,2,1,query='qwerty',vector_weight=0),([],[]))
+        recalled,_=retrieve(self.snapshot,self.vectors[0],3,2,1,query='qwerty')
+        self.assertEqual(recalled[0].chunk.doc_id,'0')
+        self.assertAlmostEqual(recalled[0].relevance,1)
+
+    def test_hybrid_validation(self):
+        for kwargs in [dict(query=''), dict(query='正文',vector_weight=-1),
+                       dict(query='正文',rrf_k=0)]:
+            with self.assertRaises(ValueError):
+                retrieve(self.snapshot,self.vectors[0],**kwargs)
+
+    def test_bm25_restored_from_same_snapshot_and_removed_chunks_excluded(self):
+        restored,_=load_current(self.root,'same')
+        self.assertEqual(restored.bm25.search('2',10),self.snapshot.bm25.search('2',10))
+        save_snapshot(self.root,'new',{},self.docs[:1],self.chunks[:1],self.vectors[:1])
+        restored,_=load_current(self.root,'new')
+        self.assertEqual(restored.bm25.search('2',10),[])
 
     def test_new_generation_replaces_removed_document(self):
         new=save_snapshot(self.root,'new',{},self.docs[:1],self.chunks[:1],self.vectors[:1])

@@ -13,6 +13,7 @@ import numpy as np
 
 from .chunker import CHUNKER_VERSION
 from .document_parser import PARSER_VERSION, source_files
+from .lexical_index import BM25Index, LEXICAL_VERSION
 from .schemas import Chunk, Document
 
 STORE_VERSION = 'faiss-sqlite-v1'
@@ -32,13 +33,15 @@ def fingerprint(doc_directory, model_directory, chunk_tokens, overlap_tokens):
     if not model_files or not (model_directory/'model.safetensors').exists():
         raise ValueError(f'模型目录缺少权重或配置：{model_directory}')
     config = dict(store_version=STORE_VERSION, parser=PARSER_VERSION, chunker=CHUNKER_VERSION,
+                  lexical=LEXICAL_VERSION,
                   chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens,
                   model_files={str(p.relative_to(model_directory)):sha256(p) for p in model_files},
                   documents={str(p.relative_to(doc_directory)):sha256(p) for p in source_files(doc_directory)},
                   dimension=768, dtype='float32', normalize=True, metric='inner_product',
                   document_prompt='title: {title} | text: {question_and_body}', query_prompt='SearchQuery',
                   dependencies={name:importlib.metadata.version(name) for name in
-                                ('sentence-transformers', 'transformers', 'torch', 'faiss-cpu')})
+                                ('sentence-transformers', 'transformers', 'torch', 'faiss-cpu',
+                                 'langchain-text-splitters', 'jieba')})
     value = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     return value, config
 
@@ -51,6 +54,9 @@ class Snapshot:
         self.chunks = chunks
         self.manifest = manifest
         self.vectors = index.reconstruct_n(0, index.ntotal)
+        # 由 SQLite 恢复的同一批 chunks 构建，ID 与 FAISS 完全一致，不重复做 embedding。
+        self.bm25 = BM25Index(f'{self.documents[c.doc_id].title}\n'
+                              f'{self.documents[c.doc_id].question}\n{c.text}' for c in chunks)
 
 
 def load_current(root: Path, expected_fingerprint):

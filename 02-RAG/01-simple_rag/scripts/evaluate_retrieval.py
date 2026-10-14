@@ -35,7 +35,7 @@ def main():
     model=Embedder(args.model_path)
     rows=[]
     for query,expected in CASES:
-        recalled,selected=retrieve(snapshot,model.query(query),20,4,.7)
+        recalled,selected=retrieve(snapshot,model.query(query),20,4,.7,query=query)
         rank=next((i for i,h in enumerate(recalled,1)
                    if snapshot.documents[h.chunk.doc_id].metadata.get('pair_id')==expected),None)
         evidence,_,_=build_context(snapshot,selected)

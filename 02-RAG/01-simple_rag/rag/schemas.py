@@ -29,6 +29,11 @@ class Hit:
     relevance: float
     redundancy: float = 0.0
     mmr_score: float = 0.0
+    vector_score: float | None = None
+    bm25_score: float | None = None
+    vector_rank: int | None = None
+    bm25_rank: int | None = None
+    rrf_score: float = 0.0
 
 
 @dataclass

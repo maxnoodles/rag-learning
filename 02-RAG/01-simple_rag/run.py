@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""打印 RAG 关键结果；后续自动复用索引，--rebuild 强制重建。"""
+"""打印递归切块、FAISS + BM25 混合检索与 MMR 的关键结果；当前每次重建索引。"""
 import argparse
 import fcntl
 import json
@@ -61,12 +61,20 @@ def execute(args):
             finally:
                 fcntl.flock(lock,fcntl.LOCK_UN)
         report.update(generation=snapshot.generation,document_count=len(snapshot.documents),chunk_count=len(snapshot.chunks))
-        query_vector = embedder.query(args.query)
-        recalled, selected = retrieve(snapshot,query_vector,args.fetch_k,args.top_k,args.mmr_lambda)
-        print(f'检索：召回 {len(recalled)} 个候选 → MMR 选择 {len(selected)} 个片段',flush=True)
+        query_vector = embedder.query(args.query) if args.vector_weight > 0 else None
+        recalled, selected = retrieve(snapshot,query_vector,args.fetch_k,args.top_k,args.mmr_lambda,
+                                      query=args.query,vector_weight=args.vector_weight,rrf_k=args.rrf_k)
+        report['retrieval'] = dict(method='weighted_rrf_mmr', vector_weight=args.vector_weight,
+                                   rrf_k=args.rrf_k,fetch_k=args.fetch_k,top_k=args.top_k,
+                                   mmr_lambda=args.mmr_lambda)
+        channels = 'FAISS' if args.vector_weight == 1 else 'BM25' if args.vector_weight == 0 else 'FAISS + BM25'
+        print(f'检索：{channels} → RRF 召回 {len(recalled)} 个候选 → MMR 选择 {len(selected)} 个片段',flush=True)
         for rank,hit in enumerate(selected,1):
             doc = snapshot.documents[hit.chunk.doc_id]
-            print(f'  #{rank} {doc.source} chunk={hit.chunk.chunk_id} | relevance={hit.relevance:.6f} '
+            vector_score = f'{hit.vector_score:.6f}' if hit.vector_score is not None else '-'
+            bm25_score = f'{hit.bm25_score:.6f}' if hit.bm25_score is not None else '-'
+            print(f'  #{rank} {doc.source} chunk={hit.chunk.chunk_id} | vector={vector_score} '
+                  f'BM25={bm25_score} RRF={hit.rrf_score:.6f} relevance={hit.relevance:.6f} '
                   f'redundancy={hit.redundancy:.6f} MMR={hit.mmr_score:.6f}',flush=True)
         evidence, context, events = build_context(snapshot,selected,args.context_tokens)
         print(f'上下文：{len(evidence)} 组证据；预算 {args.context_tokens} tokens',flush=True)
@@ -116,6 +124,8 @@ def main():
     parser.add_argument('--fetch-k',type=int,default=20)
     parser.add_argument('--top-k',type=int,default=4)
     parser.add_argument('--mmr-lambda',type=float,default=0.7)
+    parser.add_argument('--vector-weight',type=float,default=0.5,help='RRF 向量权重；0=仅 BM25，1=仅向量')
+    parser.add_argument('--rrf-k',type=int,default=60,help='RRF 排名平滑常数，至少为 1')
     parser.add_argument('--context-tokens',type=int,default=6000)
     parser.add_argument('--device',choices=['auto','mps','cpu'],default='auto')
     parser.add_argument('--codex-model',default=None,help='省略时使用 Codex 当前默认模型')
@@ -129,6 +139,8 @@ def main():
         parser.error('32 <= chunk-tokens <= 8192；0 <= overlap-tokens < chunk-tokens')
     if args.context_tokens < 64 or args.timeout <= 0:
         parser.error('context-tokens 至少 64，timeout 必须为正数')
+    if not 0 <= args.vector_weight <= 1 or args.rrf_k < 1:
+        parser.error('0 <= vector-weight <= 1；rrf-k 至少为 1')
     args.rebuild = True
     args.docs=args.docs.resolve(); args.model_path=args.model_path.resolve(); args.index_dir=args.index_dir.resolve()
     try:
