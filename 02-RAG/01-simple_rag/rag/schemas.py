@@ -36,6 +36,7 @@ class Hit:
     rrf_score: float = 0.0
     retrieval_rounds: list[str] = field(default_factory=list)
     cross_encoder_score: float | None = None
+    mmr_relevance: float | None = None
 
 
 @dataclass

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""两轮混合检索 → 合并去重 → Cross-Encoder 重排；当前每次重建索引。"""
+"""两轮混合检索 → 合并去重 → MMR 压缩 → Cross-Encoder 重排；当前每次重建索引。"""
 import argparse
 import fcntl
 import json
@@ -16,7 +16,7 @@ from rag.codex_adapter import abstract_query, generate
 from rag.context_builder import build_context, make_prompt, token_count
 from rag.document_parser import parse_documents
 from rag.embedder import Embedder
-from rag.retriever import recall, merge_rounds
+from rag.retriever import recall, merge_rounds, select_mmr
 from rag.reranker import Reranker
 from rag.vector_store import fingerprint, load_current, save_snapshot
 
@@ -26,6 +26,129 @@ DEFAULT_RERANKER = ROOT/'artifacts/models/bge-reranker-base'
 DEFAULT_QUERY = 'FAISS IndexFlatIP 中的 Flat 和 IP 分别是什么意思？为什么归一化后可以按余弦相似度检索？'
 
 
+def prepare_index(args, report):
+    """加载或构建索引，记录索引信息并返回快照和 Embedding 模型。"""
+    identity, config = fingerprint(args.docs,args.model_path,args.chunk_tokens,args.overlap_tokens)
+    args.index_dir.mkdir(parents=True,exist_ok=True)
+    with (args.index_dir/'build.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        try:
+            snapshot, reason = load_current(args.index_dir,identity)
+            if args.rebuild:
+                snapshot, reason = None,'指定了 --rebuild，强制重建'
+            report['cache_hit'] = snapshot is not None
+            report['cache_reason'] = reason
+            print(('缓存命中：' if snapshot else '需要建库：')+reason,flush=True)
+            embedder = Embedder(args.model_path,args.device)
+            print(f'Embedding：设备 {embedder.device}；{embedder.dimension} 维',flush=True)
+            if snapshot is None:
+                documents = parse_documents(args.docs)
+                chunks = make_chunks(documents,embedder.tokenizer,args.chunk_tokens,args.overlap_tokens)
+                print(f'建库：{len(documents)} 文档 → {len(chunks)} chunks',flush=True)
+                vectors = embedder.documents(chunks)
+                report['document_embedding_calls'] = 1
+                # 建库中源文件变化时保留上一快照，避免发布混合版本。
+                after, _ = fingerprint(args.docs,args.model_path,args.chunk_tokens,args.overlap_tokens)
+                if after != identity:
+                    raise RuntimeError('建库期间文档或模型发生变化，未发布；请重新运行')
+                snapshot = save_snapshot(args.index_dir,identity,config,documents,chunks,vectors)
+                print('索引已保存',flush=True)
+            else:
+                report['document_embedding_calls'] = 0
+        finally:
+            fcntl.flock(lock,fcntl.LOCK_UN)
+    report.update(generation=snapshot.generation,document_count=len(snapshot.documents),chunk_count=len(snapshot.chunks))
+    return snapshot, embedder
+
+
+def process_query(args, snapshot, embedder, report):
+    """执行两轮检索、MMR 压缩和重排，返回回答所需的证据与上下文。"""
+    artifact = args.output_json
+    report['retrieval'] = dict(method='two_round_rrf_mmr_cross_encoder', vector_weight=args.vector_weight,
+                               rrf_k=args.rrf_k,fetch_k=args.fetch_k,top_k=args.top_k,
+                               mmr_k=args.mmr_k,top_n=args.top_n,mmr_lambda=args.mmr_lambda,
+                               mmr_relevance_source='best_round_retrieval_clipped_0_1',
+                               reranker_model=str(args.reranker_model_path))
+    channels = 'FAISS' if args.vector_weight == 1 else 'BM25' if args.vector_weight == 0 else 'FAISS + BM25'
+    def search_round(name, query):
+        query_vector = embedder.query(query) if args.vector_weight > 0 else None
+        hits = recall(snapshot,query_vector,args.fetch_k,args.top_k,
+                      query=query,vector_weight=args.vector_weight,rrf_k=args.rrf_k)
+        print(f'{name}：{channels} → RRF 保留 {len(hits)} 个候选',flush=True)
+        if artifact:
+            report.setdefault('retrieval_rounds',[]).append(
+                dict(name=name,query=query,recalled=[asdict(hit) for hit in hits]))
+        return hits
+
+    original_hits = search_round('original',args.query)
+    print('Codex 正在抽象问题…',flush=True)
+    abstraction = abstract_query(args.query,args.codex_model,args.timeout,args.codex_bin)
+    rewritten = abstraction['abstract_query']
+    report['abstract_query'] = rewritten
+    if artifact:
+        report['query_abstraction'] = abstraction
+    print(f'抽象问题：{rewritten}',flush=True)
+    abstract_hits = search_round('abstract',rewritten)
+    recalled = merge_rounds(('original',original_hits),('abstract',abstract_hits))
+    if artifact:
+        report['merged'] = [asdict(hit) for hit in recalled]
+    print(f'Merge：{len(original_hits)} + {len(abstract_hits)} → 去重后 {len(recalled)} 个候选',flush=True)
+    mmr_candidates = select_mmr(snapshot,recalled,args.mmr_k,args.mmr_lambda)
+    if artifact:
+        report['mmr_candidates'] = [asdict(hit) for hit in mmr_candidates]
+    print(f'MMR（lambda={args.mmr_lambda}）：{len(recalled)} → {len(mmr_candidates)} 个候选'
+          f'（上限 mmr_k={args.mmr_k}）',flush=True)
+    if mmr_candidates:
+        reranker = Reranker(args.reranker_model_path,args.device,args.reranker_batch_size)
+        print(f'Cross-Encoder：{args.reranker_model_path.name}；设备 {reranker.device}',flush=True)
+        ranked, selected = reranker.rerank(args.query,mmr_candidates,args.top_n)
+    else:
+        ranked, selected = [], []
+    print(f'重排：原始问题与 MMR 保留候选联合打分 → 按 Cross-Encoder 分数取'
+          f' top_n={args.top_n}，选中 {len(selected)} 个片段',flush=True)
+    for rank,hit in enumerate(selected,1):
+        doc = snapshot.documents[hit.chunk.doc_id]
+        vector_score = f'{hit.vector_score:.6f}' if hit.vector_score is not None else '-'
+        bm25_score = f'{hit.bm25_score:.6f}' if hit.bm25_score is not None else '-'
+        print(f'  #{rank} {doc.source} chunk={hit.chunk.chunk_id} | vector={vector_score} '
+              f'BM25={bm25_score} RRF={hit.rrf_score:.6f} '
+              f'CrossEncoder={hit.cross_encoder_score:.6f} '
+              f'MMR relevance={hit.mmr_relevance:.6f} redundancy={hit.redundancy:.6f} '
+              f'MMR={hit.mmr_score:.6f} rounds={hit.retrieval_rounds}',flush=True)
+    evidence, context, events = build_context(snapshot,selected,args.context_tokens)
+    print(f'上下文：{len(evidence)} 组证据；预算 {args.context_tokens} tokens',flush=True)
+    for event in events:
+        print(f'  {event}',flush=True)
+    print(context,flush=True)
+    # 详细序列化和展示用计数只在请求保存报告时执行。
+    if artifact:
+        report.update(recalled=[asdict(h) for h in recalled],
+                      reranked=[asdict(h) for h in ranked],
+                      selected=[asdict(h) for h in selected],
+                      evidence=[asdict(e) for e in evidence],
+                      context_tokens_estimated=token_count(context))
+    return evidence, context
+
+
+def generate_answer(args, evidence, context, report):
+    """构造 prompt 并调用大模型回答，处理仅检索或证据不足的情况。"""
+    prompt = make_prompt(args.query,context) if args.output_json or (evidence and not args.retrieve_only) else None
+    if args.output_json:
+        report['prompt'] = prompt
+    if args.retrieve_only:
+        report['answer'] = None
+        print('--retrieve-only：检索完成',flush=True)
+    elif not evidence:
+        report['answer'] = {'status':'insufficient','answer':'上下文预算内没有可用证据，无法回答。','citations':[]}
+        print(report['answer']['answer'],flush=True)
+    else:
+        print('Codex 正在生成回答…',flush=True)
+        report['answer'] = generate(prompt,{e.citation_id for e in evidence},args.codex_model,
+                                    args.timeout,args.codex_bin)
+        print(report['answer']['answer'],flush=True)
+        print(f'回答状态：{report["answer"]["status"]}；来源：{report["answer"]["citations"]}',flush=True)
+
+
 def execute(args):
     report = {'query':args.query,'status':'running'}
     artifact = args.output_json
@@ -33,102 +156,9 @@ def execute(args):
     try:
         if artifact:
             artifact.parent.mkdir(parents=True,exist_ok=True)
-        identity, config = fingerprint(args.docs,args.model_path,args.chunk_tokens,args.overlap_tokens)
-        args.index_dir.mkdir(parents=True,exist_ok=True)
-        with (args.index_dir/'build.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            try:
-                snapshot, reason = load_current(args.index_dir,identity)
-                if args.rebuild:
-                    snapshot, reason = None,'指定了 --rebuild，强制重建'
-                report['cache_hit'] = snapshot is not None
-                report['cache_reason'] = reason
-                print(('缓存命中：' if snapshot else '需要建库：')+reason,flush=True)
-                embedder = Embedder(args.model_path,args.device)
-                print(f'Embedding：设备 {embedder.device}；{embedder.dimension} 维',flush=True)
-                if snapshot is None:
-                    documents = parse_documents(args.docs)
-                    chunks = make_chunks(documents,embedder.tokenizer,args.chunk_tokens,args.overlap_tokens)
-                    print(f'建库：{len(documents)} 文档 → {len(chunks)} chunks',flush=True)
-                    vectors = embedder.documents(chunks)
-                    report['document_embedding_calls'] = 1
-                    # 建库中源文件变化时保留上一快照，避免发布混合版本。
-                    after, _ = fingerprint(args.docs,args.model_path,args.chunk_tokens,args.overlap_tokens)
-                    if after != identity:
-                        raise RuntimeError('建库期间文档或模型发生变化，未发布；请重新运行')
-                    snapshot = save_snapshot(args.index_dir,identity,config,documents,chunks,vectors)
-                    print('索引已保存',flush=True)
-                else:
-                    report['document_embedding_calls'] = 0
-            finally:
-                fcntl.flock(lock,fcntl.LOCK_UN)
-        report.update(generation=snapshot.generation,document_count=len(snapshot.documents),chunk_count=len(snapshot.chunks))
-        report['retrieval'] = dict(method='two_round_rrf_cross_encoder', vector_weight=args.vector_weight,
-                                   rrf_k=args.rrf_k,fetch_k=args.fetch_k,top_k=args.top_k,
-                                   top_n=args.top_n,reranker_model=str(args.reranker_model_path))
-        channels = 'FAISS' if args.vector_weight == 1 else 'BM25' if args.vector_weight == 0 else 'FAISS + BM25'
-        def search_round(name, query):
-            query_vector = embedder.query(query) if args.vector_weight > 0 else None
-            hits = recall(snapshot,query_vector,args.fetch_k,args.top_k,
-                          query=query,vector_weight=args.vector_weight,rrf_k=args.rrf_k)
-            print(f'{name}：{channels} → RRF 保留 {len(hits)} 个候选',flush=True)
-            if artifact:
-                report.setdefault('retrieval_rounds',[]).append(
-                    dict(name=name,query=query,recalled=[asdict(hit) for hit in hits]))
-            return hits
-
-        original_hits = search_round('original',args.query)
-        print('Codex 正在抽象问题…',flush=True)
-        abstraction = abstract_query(args.query,args.codex_model,args.timeout,args.codex_bin)
-        rewritten = abstraction['abstract_query']
-        report['abstract_query'] = rewritten
-        if artifact:
-            report['query_abstraction'] = abstraction
-        print(f'抽象问题：{rewritten}',flush=True)
-        abstract_hits = search_round('abstract',rewritten)
-        recalled = merge_rounds(('original',original_hits),('abstract',abstract_hits))
-        if artifact:
-            report['merged'] = [asdict(hit) for hit in recalled]
-        print(f'Merge：{len(original_hits)} + {len(abstract_hits)} → 去重后 {len(recalled)} 个候选',flush=True)
-        if recalled:
-            reranker = Reranker(args.reranker_model_path,args.device,args.reranker_batch_size)
-            print(f'Cross-Encoder：{args.reranker_model_path.name}；设备 {reranker.device}',flush=True)
-            ranked, selected = reranker.rerank(args.query,recalled,args.top_n)
-        else:
-            ranked, selected = [], []
-        print(f'重排：原始问题与候选联合打分 → 取 top_n={args.top_n}，选中 {len(selected)} 个片段',flush=True)
-        for rank,hit in enumerate(selected,1):
-            doc = snapshot.documents[hit.chunk.doc_id]
-            vector_score = f'{hit.vector_score:.6f}' if hit.vector_score is not None else '-'
-            bm25_score = f'{hit.bm25_score:.6f}' if hit.bm25_score is not None else '-'
-            print(f'  #{rank} {doc.source} chunk={hit.chunk.chunk_id} | vector={vector_score} '
-                  f'BM25={bm25_score} RRF={hit.rrf_score:.6f} '
-                  f'CrossEncoder={hit.cross_encoder_score:.6f} rounds={hit.retrieval_rounds}',flush=True)
-        evidence, context, events = build_context(snapshot,selected,args.context_tokens)
-        print(f'上下文：{len(evidence)} 组证据；预算 {args.context_tokens} tokens',flush=True)
-        for event in events:
-            print(f'  {event}',flush=True)
-        print(context,flush=True)
-        prompt = make_prompt(args.query,context) if artifact or (evidence and not args.retrieve_only) else None
-        # 详细序列化和展示用计数只在请求保存报告时执行。
-        if artifact:
-            report.update(recalled=[asdict(h) for h in recalled],
-                          reranked=[asdict(h) for h in ranked],
-                          selected=[asdict(h) for h in selected],
-                          evidence=[asdict(e) for e in evidence],
-                          context_tokens_estimated=token_count(context),prompt=prompt)
-        if args.retrieve_only:
-            report['answer'] = None
-            print('--retrieve-only：检索完成',flush=True)
-        elif not evidence:
-            report['answer'] = {'status':'insufficient','answer':'上下文预算内没有可用证据，无法回答。','citations':[]}
-            print(report['answer']['answer'],flush=True)
-        else:
-            print('Codex 正在生成回答…',flush=True)
-            report['answer'] = generate(prompt,{e.citation_id for e in evidence},args.codex_model,
-                                        args.timeout,args.codex_bin)
-            print(report['answer']['answer'],flush=True)
-            print(f'回答状态：{report["answer"]["status"]}；来源：{report["answer"]["citations"]}',flush=True)
+        snapshot, embedder = prepare_index(args, report)
+        evidence, context = process_query(args, snapshot, embedder, report)
+        generate_answer(args, evidence, context, report)
         report['status'] = 'completed'
         return report
     except Exception as exc:
@@ -150,9 +180,11 @@ def main():
     parser.add_argument('--retrieve-only',action='store_true',help='跳过最终回答；仍调用 Codex 抽象问题')
     parser.add_argument('--chunk-tokens',type=int,default=512)
     parser.add_argument('--overlap-tokens',type=int,default=64)
-    parser.add_argument('--fetch-k',type=int,default=20,help='每轮 FAISS/BM25 各路召回上限')
+    parser.add_argument('--fetch-k',type=int,default=10,help='每轮 FAISS/BM25 各路召回上限')
     parser.add_argument('--top-k',type=int,default=4,help='每轮 RRF 融合后保留的候选数')
-    parser.add_argument('--top-n',type=int,default=2,help='两轮合并后 Cross-Encoder 最终保留数')
+    parser.add_argument('--mmr-k',type=int,default=4,help='两轮合并后 MMR 保留并交给 Cross-Encoder 的候选数')
+    parser.add_argument('--top-n',type=int,default=2,help='Cross-Encoder 重排后最终保留数')
+    parser.add_argument('--mmr-lambda',type=float,default=0.7,help='MMR 相关性权重 [0,1]；1=压缩时仅按召回相关性')
     parser.add_argument('--reranker-model-path',type=Path,default=DEFAULT_RERANKER)
     parser.add_argument('--reranker-batch-size',type=int,default=4)
     parser.add_argument('--vector-weight',type=float,default=0.5,help='RRF 向量权重；0=仅 BM25，1=仅向量')
@@ -164,10 +196,12 @@ def main():
     parser.add_argument('--timeout',type=int,default=300)
     parser.add_argument('--output-json',type=Path,default=None,help='可选，保存详细检索结果、证据和 prompt')
     args = parser.parse_args()
-    if not args.query.strip() or not 1 <= args.top_k <= args.fetch_k or not 1 <= args.top_n <= 2*args.top_k:
-        parser.error('query 不能为空；1 <= top-k <= fetch-k；1 <= top-n <= 2 * top-k')
+    if not args.query.strip() or not 1 <= args.top_k <= args.fetch_k or not 1 <= args.top_n <= args.mmr_k <= 2*args.top_k:
+        parser.error('query 不能为空；1 <= top-k <= fetch-k；1 <= top-n <= mmr-k <= 2 * top-k')
     if args.reranker_batch_size < 1:
         parser.error('reranker-batch-size 至少为 1')
+    if not 0 <= args.mmr_lambda <= 1:
+        parser.error('0 <= mmr-lambda <= 1')
     if not 32 <= args.chunk_tokens <= 8192 or not 0 <= args.overlap_tokens < args.chunk_tokens:
         parser.error('32 <= chunk-tokens <= 8192；0 <= overlap-tokens < chunk-tokens')
     if args.context_tokens < 64 or args.timeout <= 0:

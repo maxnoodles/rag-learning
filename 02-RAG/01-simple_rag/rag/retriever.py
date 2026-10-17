@@ -1,5 +1,7 @@
-"""FAISS + BM25 → 加权 RRF 召回；保留 MMR 作为旧流程对照。"""
+"""FAISS + BM25 → 加权 RRF 召回；合并后由 MMR 压缩候选。"""
 from dataclasses import replace
+
+import numpy as np
 
 from .schemas import Hit
 
@@ -39,17 +41,53 @@ def recall(snapshot, query_vector, fetch_k=20, top_k=4, *,
 
 
 def merge_rounds(*rounds):
-    """按 chunk ID 合并，不在 Cross-Encoder 打分前截断；保留命中轮次。"""
+    """按 chunk ID 合并，保留最强召回分数和全部命中轮次，不截断。"""
     merged = {}
     for name, hits in rounds:
         for hit in hits:
             key = hit.chunk.chunk_id
             if key not in merged:
                 merged[key] = replace(hit, retrieval_rounds=[])
+            elif hit.relevance > merged[key].relevance:
+                merged[key] = replace(hit, retrieval_rounds=list(merged[key].retrieval_rounds))
             if name not in merged[key].retrieval_rounds:
                 merged[key].retrieval_rounds.append(name)
     # 首次出现顺序用于后续重排同分时稳定排序。各轮完整分数由调用方分别保存。
     return list(merged.values())
+
+
+def select_mmr(snapshot, candidates, mmr_k=4, mmr_lambda=0.7):
+    """在 Cross-Encoder 之前压缩候选，不修改输入。
+
+    relevance 来自最强命中轮次的召回分数，裁剪到 [0,1]。
+    redundancy 使用快照内归一化向量的余弦相似度，负值按 0 处理。
+    第一项始终选最相关者；后续按 MMR 选择，同分优先相关性及输入顺序。
+    """
+    if mmr_k < 1 or not 0 <= mmr_lambda <= 1:
+        raise ValueError('mmr_k 至少为 1；MMR lambda 必须在 [0,1]')
+    if not candidates:
+        return []
+    scores = np.asarray([hit.relevance for hit in candidates], dtype=np.float64)
+    if not np.isfinite(scores).all():
+        raise ValueError('召回相关性必须为有限值')
+    relevance = np.clip(scores, 0.0, 1.0)
+    vector_ids = {chunk.chunk_id: i for i, chunk in enumerate(snapshot.chunks)}
+    vectors = np.asarray([snapshot.vectors[vector_ids[hit.chunk.chunk_id]] for hit in candidates])
+    similarities = np.clip(vectors @ vectors.T, 0.0, 1.0)
+    chosen, remaining, selected = [], list(range(len(candidates))), []
+    while remaining and len(selected) < mmr_k:
+        def metrics(i):
+            redundancy = float(similarities[i, chosen].max()) if chosen else 0.0
+            score = mmr_lambda*float(relevance[i])-(1-mmr_lambda)*redundancy
+            return score, redundancy
+        best = max(remaining, key=lambda i: (
+            metrics(i)[0] if chosen else float(relevance[i]), float(relevance[i]), -i))
+        score, redundancy = metrics(best)
+        selected.append(replace(candidates[best], mmr_relevance=float(relevance[best]),
+                                redundancy=redundancy, mmr_score=score))
+        chosen.append(best)
+        remaining.remove(best)
+    return selected
 
 
 def retrieve(snapshot, query_vector, fetch_k=20, top_k=4, mmr_lambda=0.7, *,
